@@ -1,0 +1,358 @@
+---
+title: "NTS-bulk-DESeq2-trimmed"
+output: html_document
+date: "2023-09-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{R}
+library(tidyverse)
+library(edgeR)
+library(DESeq2)
+library(biomaRt)
+
+ens98<-useEnsembl(biomart = 'genes', 
+                       dataset = 'mmusculus_gene_ensembl',
+                       version = 98)
+
+attrs<-listAttributes(ens98)
+
+ens98.names<-getBM(attributes = c('ensembl_gene_id_version', 'ensembl_gene_id', "external_gene_name", "gene_biotype"),
+      mart = ens98)
+
+DESeqVolcanoPlot<-function(x){
+  x %>% mutate(color=ifelse(padj<0.05 & log2FoldChange>0, "firebrick3",
+                               ifelse(padj<0.05 & log2FoldChange<0, "dodgerblue3", "black"))) %>% ggplot(aes(x=log2FoldChange, y= -log10(padj), color=color))+
+  geom_point()+
+  geom_hline(yintercept = -log10(0.05), lty=2, alpha=0.5)+
+  labs(x="log2(Fold Change)", y="-log10(FDR)")+
+  scale_color_identity()
+}
+
+
+DESeqVolcanoPlotFC<-function(x){
+  x %>% mutate(color=ifelse(padj<0.05 & log2FoldChange>1, "firebrick3",
+                               ifelse(padj<0.05 & log2FoldChange< -1, "dodgerblue3", "black"))) %>% ggplot(aes(x=log2FoldChange, y= -log10(padj), color=color))+
+  geom_point()+
+  geom_hline(yintercept = -log10(0.05), lty=2, alpha=0.5)+
+  labs(x="log2(Fold Change)", y="-log10(FDR)")+
+  scale_color_identity()+
+  geom_vline(xintercept = 1, lty=2, alpha=0.5)+
+  geom_vline(xintercept = -1, lty=2, alpha=0.5)
+}
+```
+
+### Process raw counts
+
+```{R, eval=F}
+rawCounts<-read.table("../output/counts/all-samples-counts-trimmed.txt", sep="\t", header = T, stringsAsFactors = F, quote = "")
+
+### Remove extraneous columns
+rawCounts$Chr<-rawCounts$Start<-rawCounts$End<-rawCounts$Strand<-rawCounts$Length<-NULL
+
+### Set gene IDs as rownames
+rownames(rawCounts)<-rawCounts$Geneid
+rawCounts$Geneid<-NULL
+
+### Fix column names
+colnames(rawCounts)<-str_sub(colnames(rawCounts), start = 57, end = -31)
+
+### Add gene names, etc.
+rawCountsOut<-merge(ens98.names, rawCounts, by.x=1, by.y="row.names")
+write.table(rawCountsOut, "../output/counts/all-samples-counts-trimmed-processed.txt", sep="\t", col.names = T, row.names = F, quote=F)
+```
+
+### Normalized counts by TMM
+
+```{R}
+countsIn<-read.table("../output/counts/all-samples-counts-trimmed-processed.txt", sep="\t", header=T, stringsAsFactors = F, quote="")
+rownames(countsIn)<-countsIn$ensembl_gene_id
+geneinfo<-countsIn[2:4]
+
+countsIn %>%
+  dplyr::select(-ensembl_gene_id_version, -ensembl_gene_id, -gene_biotype) %>%
+  dplyr::filter(external_gene_name!="") %>%
+  group_by(external_gene_name) %>%
+  summarise(across(everything(), sum), .groups = 'drop') %>%
+  as.data.frame() -> countsSum
+write.table(countsSum, "../output/counts/normalized/RawCounts-trimmed.txt", sep="\t", col.names = T, row.names = F, quote=F)
+
+rownames(countsSum)<-countsSum$external_gene_name
+
+y <- DGEList(counts = countsSum[,2:ncol(countsSum)], genes = countsSum$external_gene_name)
+
+cpm(y) %>%
+  as.data.frame %>%
+  rownames_to_column("Gene") -> cpmOut
+
+write.table(cpmOut, "../output/counts/normalized/CPM-normalized-trimmed.txt", sep="\t", col.names = T, row.names = F, quote=F)
+
+y <- calcNormFactors(y)
+
+cpm(y) %>%
+  as.data.frame %>%
+  rownames_to_column("Gene") -> cpmOut
+
+write.table(cpmOut, "../output/counts/normalized/TMMCPM-normalized-trimmed.txt", sep="\t", col.names = T, row.names = F, quote=F)
+
+## Filter
+keep<-rowSums(cpm(y)>0.25)>=4
+table(keep)
+y.filt<-y[keep,,keep.lib.sizes = FALSE]
+
+cpm(y.filt) %>%
+  as.data.frame %>%
+  rownames_to_column("Gene") -> cpmOut
+
+write.table(cpmOut, "../output/counts/normalized/CPM-normalized-trimmed-filtered.txt", sep="\t", col.names = T, row.names = F, quote=F)
+
+
+y.filt <- calcNormFactors(y.filt)
+
+cpm(y.filt) %>%
+  as.data.frame %>%
+  rownames_to_column("Gene") -> cpmOut
+
+write.table(cpmOut, "../output/counts/normalized/TMMCPM-normalized-trimmed-filtered.txt", sep="\t", col.names = T, row.names = F, quote=F)
+
+```
+
+### DESeq2
+
+```{R}
+### Make metadata df
+md.df<-data.frame(sampleName=colnames(countsIn)[5:ncol(countsIn)])
+md.df$age<-factor(ifelse(grepl(md.df$sampleName, pattern = "^Y"), "Young", "Aged"), levels = c("Young", "Aged"))
+md.df$sex<-ifelse(grepl(md.df$sampleName, pattern = ".M."), "Male", "Female")
+md.df$treatment<-factor(ifelse(grepl(md.df$sampleName, pattern = "NTS"), "NTS", "Control"), levels = c("Control", "NTS"))
+md.df$SAT<-paste0(md.df$sex, ".", md.df$age, ".", md.df$treatment)
+write.table(md.df, "../output/DESeq2/metadata.txt", sep="\t", col.names = T, row.names = F, quote=F)
+
+#dds <- DESeqDataSetFromMatrix(countData = countsIn[,5:ncol(countsIn)], colData = md.df, design = ~age + sex + treatment + age:sex + age:treatment + sex:treatment)
+dds <- DESeqDataSetFromMatrix(countData = countsIn[,5:ncol(countsIn)], colData = md.df, design = ~0 + SAT)
+
+10/(min(colSums(counts(dds)))/1000000)
+
+
+keep <- rowSums(cpm(counts(dds))>0.1)>=4
+table(keep)
+dds<-dds[keep,]
+
+### Run DESeq2
+dds <- DESeq(dds)
+
+### Get PCA (DESeq2 style, 500 most variable genes)
+vsd<-vst(dds)
+vsd.out<-as.data.frame(assay(vsd))
+vsd.out<-merge(geneinfo, vsd.out, by.x=1, by.y="row.names")
+write.table(vsd.out, "../output/DESeq2/trimmed/Filtered-VSD-normalized-expression.txt", sep="\t", col.names = T, row.names = F, quote=F)
+
+plotPCA(vsd, intgroup="SAT")
+ggsave("../plots/DESeq2/trimmed/PCA/VariableGenes-byGroup.png", width = 8, height = 6)
+
+plotPCA(vsd, intgroup="sex")
+ggsave("../plots/DESeq2/trimmed/PCA/VariableGenes-bySex.png", width = 8, height = 6)
+
+plotPCA(vsd, intgroup="age")
+ggsave("../plots/DESeq2/trimmed/PCA/VariableGenes-byAge.png", width = 8, height = 6)
+
+plotPCA(vsd, intgroup="treatment")
+
+### Get PCA (all genes)
+pc.all<-prcomp(t(assay(vsd)))
+
+pc1.lab<-paste0("PC1\n", signif(summary(pc.all)$importance[2,1]*100, 3), "% of variance explained")
+pc2.lab<-paste0("PC2\n", signif(summary(pc.all)$importance[2,2]*100, 3), "% of variance explained")
+
+pc.all$x %>%
+  as.data.frame %>%
+  rownames_to_column("Sample") %>%
+  inner_join(md.df, by=c("Sample"="sampleName")) %>%
+  ggplot(aes(x=PC1, y=PC2, color=sex))+
+  geom_point(size=3)+
+  labs(x=pc1.lab, y=pc2.lab)
+ggsave("../plots/DESeq2/trimmed/PCA/AllGenes-bySex.png", width = 8, height = 6)
+
+pc.all$x %>%
+  as.data.frame %>%
+  rownames_to_column("Sample") %>%
+  inner_join(md.df, by=c("Sample"="sampleName")) %>%
+  ggplot(aes(x=PC1, y=PC2, color=age))+
+  geom_point(size=3)+
+  labs(x=pc1.lab, y=pc2.lab)
+ggsave("../plots/DESeq2/trimmed/PCA/AllGenes-byAge.png", width = 8, height = 6)
+
+pc.all$x %>%
+  as.data.frame %>%
+  rownames_to_column("Sample") %>%
+  inner_join(md.df, by=c("Sample"="sampleName")) %>%
+  ggplot(aes(x=PC1, y=PC2, color=treatment))+
+  geom_point(size=3)+
+  labs(x=pc1.lab, y=pc2.lab)
+ggsave("../plots/DESeq2/trimmed/PCA/AllGenes-byTreatment.png", width = 8, height = 6)
+
+pc.all$x %>%
+  as.data.frame %>%
+  rownames_to_column("Sample") %>%
+  inner_join(md.df, by=c("Sample"="sampleName")) %>%
+  ggplot(aes(x=PC1, y=PC2, color=SAT))+
+  geom_point(size=3)+
+  labs(x=pc1.lab, y=pc2.lab, color="Group")
+ggsave("../plots/DESeq2/trimmed/PCA/AllGenes-byGroup.png", width = 8, height = 6)
+
+
+resultsNames(dds)
+
+### MvF
+### Young Control
+res.df<-as.data.frame(results(dds, contrast = c("SAT", "Female.Young.Control", "Male.Young.Control")))
+res.df<-merge(geneinfo, res.df, by.x=1, by.y="row.names")
+write.table(res.df, "../output/DESeq2/trimmed/MvF-Young-Control.tsv", sep="\t", col.names = T, row.names = F, quote=F)
+
+### Young NTS
+res.df<-as.data.frame(results(dds, contrast = c("SAT", "Female.Young.NTS", "Male.Young.NTS")))
+res.df<-merge(geneinfo, res.df, by.x=1, by.y="row.names")
+write.table(res.df, "../output/DESeq2/trimmed/MvF-Young-NTS.tsv", sep="\t", col.names = T, row.names = F, quote=F)
+
+### Aged Control
+res.df<-as.data.frame(results(dds, contrast = c("SAT", "Female.Aged.Control", "Male.Aged.Control")))
+res.df<-merge(geneinfo, res.df, by.x=1, by.y="row.names")
+write.table(res.df, "../output/DESeq2/trimmed/MvF-Aged-Control.tsv", sep="\t", col.names = T, row.names = F, quote=F)
+
+### Aged NTS
+res.df<-as.data.frame(results(dds, contrast = c("SAT", "Female.Aged.NTS", "Male.Aged.NTS")))
+res.df<-merge(geneinfo, res.df, by.x=1, by.y="row.names")
+write.table(res.df, "../output/DESeq2/trimmed/MvF-Aged-NTS.tsv", sep="\t", col.names = T, row.names = F, quote=F)
+
+### YvA
+### Female control
+res.df<-as.data.frame(results(dds, contrast = c("SAT", "Female.Young.Control", "Female.Aged.Control")))
+res.df<-merge(geneinfo, res.df, by.x=1, by.y="row.names")
+write.table(res.df, "../output/DESeq2/trimmed/YvA-Female-Control.tsv", sep="\t", col.names = T, row.names = F, quote=F)
+
+
+### Female NTS
+res.df<-as.data.frame(results(dds, contrast = c("SAT", "Female.Young.NTS", "Female.Aged.NTS")))
+res.df<-merge(geneinfo, res.df, by.x=1, by.y="row.names")
+write.table(res.df, "../output/DESeq2/trimmed/YvA-Female-NTS.tsv", sep="\t", col.names = T, row.names = F, quote=F)
+
+### Male control
+res.df<-as.data.frame(results(dds, contrast = c("SAT", "Male.Young.Control", "Male.Aged.Control")))
+res.df<-merge(geneinfo, res.df, by.x=1, by.y="row.names")
+write.table(res.df, "../output/DESeq2/trimmed/YvA-Male-Control.tsv", sep="\t", col.names = T, row.names = F, quote=F)
+
+
+### Male NTS
+res.df<-as.data.frame(results(dds, contrast = c("SAT", "Male.Young.NTS", "Male.Aged.NTS")))
+res.df<-merge(geneinfo, res.df, by.x=1, by.y="row.names")
+write.table(res.df, "../output/DESeq2/trimmed/YvA-Male-NTS.tsv", sep="\t", col.names = T, row.names = F, quote=F)
+
+### CvN
+### Young Female
+res.df<-as.data.frame(results(dds, contrast = c("SAT", "Female.Young.Control", "Female.Young.NTS")))
+res.df<-merge(geneinfo, res.df, by.x=1, by.y="row.names")
+write.table(res.df, "../output/DESeq2/trimmed/CvN-Female-Young.tsv", sep="\t", col.names = T, row.names = F, quote=F)
+
+
+### Aged Female
+res.df<-as.data.frame(results(dds, contrast = c("SAT", "Female.Aged.Control", "Female.Aged.NTS")))
+res.df<-merge(geneinfo, res.df, by.x=1, by.y="row.names")
+write.table(res.df, "../output/DESeq2/trimmed/CvN-Female-Aged.tsv", sep="\t", col.names = T, row.names = F, quote=F)
+
+### Young Male
+res.df<-as.data.frame(results(dds, contrast = c("SAT", "Male.Young.Control", "Male.Young.NTS")))
+res.df<-merge(geneinfo, res.df, by.x=1, by.y="row.names")
+write.table(res.df, "../output/DESeq2/trimmed/CvN-Male-Young.tsv", sep="\t", col.names = T, row.names = F, quote=F)
+
+
+### Aged Male
+res.df<-as.data.frame(results(dds, contrast = c("SAT", "Male.Aged.Control", "Male.Aged.NTS")))
+res.df<-merge(geneinfo, res.df, by.x=1, by.y="row.names")
+write.table(res.df, "../output/DESeq2/trimmed/CvN-Male-Aged.tsv", sep="\t", col.names = T, row.names = F, quote=F)
+
+```
+
+### Make Volcano Plots
+
+```{R}
+de.files<-Sys.glob("../output/DESeq2/trimmed/*.tsv")
+
+de.res.list<-list()
+
+for(i in de.files){
+  oneFile=i
+  fileNameOut<-unlist(lapply(str_split(oneFile, pattern = "/"), "[[", 5))
+  fileNameOut<-str_sub(fileNameOut, end = -5)
+  fileNameOut<-paste0("../plots/DESeq2/trimmed/VolcanoPlots/", fileNameOut, ".png")
+  
+  tmp<-read.table(oneFile, sep="\t", header=T, stringsAsFactors = F, quote="")
+  
+  DESeqVolcanoPlotFC(tmp)
+  ggsave(fileNameOut, width = 8, height = 6)
+  
+  tmp.sig<-tmp[which(tmp$padj<0.05),]
+  tmp.sig.fc<-tmp.sig[which(abs(tmp.sig$log2FoldChange)>=1),]
+  
+  tmp.df<-data.frame(comparison=fileNameOut, numDE=nrow(tmp.sig), numDE.FC=nrow(tmp.sig.fc))
+  
+  de.res.list[[fileNameOut]]<-tmp.df
+  
+
+}
+
+de.sum<-bind_rows(de.res.list)
+
+```
+
+
+
+### Run GO enrichment
+
+```{R}
+library(fgsea)
+
+filtCounts<-read.table("../output/DESeq2/trimmed/Filtered-VSD-normalized-expression.txt", sep="\t", header=T, stringsAsFactors = F, quote="")
+
+goall<-gmtPathways("../../../gsea-dbs/mouse/m5.go.v2023.1.Mm.symbols.gmt")
+reactome<-gmtPathways("../../../gsea-dbs/mouse/m2.cp.reactome.v2023.1.Mm.symbols.gmt")
+cts<-gmtPathways("../../../gsea-dbs/mouse/m8.all.v2023.1.Mm.symbols.gmt")
+
+### GSEA
+de.files<-Sys.glob("../output/DESeq2/trimmed/*.tsv")
+
+gsea.list<-list()
+ct.list<-list()
+
+for(i in de.files){
+  oneFile=i
+  fileName<-unlist(lapply(str_split(oneFile, pattern = "/"), "[[", 5))
+  fileName<-str_sub(fileNameOut, end = -5)
+  
+  
+  tmp<-read.table(oneFile, sep="\t", header=T, stringsAsFactors = F, quote="")
+  
+  ranks<-tmp$stat
+  names(ranks)<-tmp$external_gene_name
+  
+  set.seed(42)
+  gsea.res<-fgseaMultilevel(pathways = c(goall, reactome), stats = ranks, eps = 0)
+  gsea.res$leadingEdge<-unlist(lapply(gsea.res$leadingEdge, FUN = function(x) {paste0(x, collapse = ", ")}))
+  
+  gsea.list[[i]]<-gsea.res
+  
+  set.seed(42)
+  gsea.res<-fgseaMultilevel(pathways = c(cts), stats = ranks, eps = 0)
+  gsea.res$leadingEdge<-unlist(lapply(gsea.res$leadingEdge, FUN = function(x) {paste0(x, collapse = ", ")}))
+  
+  ct.list[[i]]<-gsea.res
+}
+
+gsea.df<-bind_rows(gsea.list, .id = "filename")
+gsea.df$filename<-unlist(lapply(str_split(gsea.df$filename, pattern = "/"), "[[", 5))
+gsea.df$filename<-str_sub(gsea.df$filename, end = -5)
+
+
+```
